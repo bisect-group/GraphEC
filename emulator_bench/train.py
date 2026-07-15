@@ -9,7 +9,13 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import KFold
 from torch_geometric.loader import DataLoader
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .utils import (
     BASELINE_ROOT,
@@ -144,7 +150,7 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     losses = []
-    progress = tqdm(dataloader, desc=desc, unit="batch", leave=False)
+    progress = progress(dataloader, desc=desc, unit="batch", leave=False)
     for batch in progress:
         batch_data, mask_data, batch_activate_site = padding_ver1(
             batch.node_feat, batch.batch, batch.node_feat.shape[1], batch.activate_site
