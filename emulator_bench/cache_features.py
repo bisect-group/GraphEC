@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .dataset_adapter import prepare_dataset
 from .utils import (
@@ -137,7 +143,7 @@ def generate_prottrans_features(
         f"[emulator_bench] generating ProtTrans features for {len(items)} entries on {device}",
         flush=True,
     )
-    for start in tqdm(range(0, len(items), batch_size), desc="ProtTrans", unit="batch"):
+    for start in progress(range(0, len(items), batch_size), desc="ProtTrans", unit="batch"):
         batch = items[start : start + batch_size]
         ids = [item["cache_key"] for item in batch]
         sequences = [" ".join(list(re.sub(r"[UZOB]", "X", item["sequence"]))) for item in batch]
@@ -203,7 +209,7 @@ def generate_active_site_features(
             f"[emulator_bench] generating active-site features for {len(missing)} entries",
             flush=True,
         )
-        for batch in tqdm(dataloader, desc="GraphEC-AS", unit="batch"):
+        for batch in progress(dataloader, desc="GraphEC-AS", unit="batch"):
             batch = batch.to(device)
             with torch.no_grad():
                 outputs = [model(batch.X, batch.node_feat, batch.edge_index, batch.seq, batch.batch).sigmoid() for model in models]

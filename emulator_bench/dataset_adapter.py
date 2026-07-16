@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .utils import (
     DEFAULT_DATASET_ROOT,
@@ -132,7 +138,7 @@ def load_split_records(
     df = df[(df["labels"].map(len) > 0) & (df["Sequence Length"] > 0)].copy()
 
     exploded_rows = []
-    for row in tqdm(df.to_dict("records"), desc=f"{split_name} full EC labels", leave=False):
+    for row in progress(df.to_dict("records"), desc=f"{split_name} full EC labels", leave=False):
         for label in row["labels"]:
             item = {
                 "Original Entry": row["Original Entry"],

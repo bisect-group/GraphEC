@@ -11,7 +11,13 @@ import scipy.sparse as ssp
 from scipy.sparse.linalg import inv
 import torch
 from torch_geometric.loader import DataLoader
-from tqdm import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 from .results import (
     compact_evaluation_summary,
@@ -113,7 +119,7 @@ def predict_scores(
     device = next(models[0].parameters()).device
     names = []
     scores = []
-    for batch in tqdm(dataloader, desc="GraphEC evaluate", unit="batch"):
+    for batch in progress(dataloader, desc="GraphEC evaluate", unit="batch"):
         batch_data, mask_data, batch_activate_site = padding_ver1(
             batch.node_feat, batch.batch, batch.node_feat.shape[1], batch.activate_site
         )
