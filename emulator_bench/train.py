@@ -150,8 +150,8 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     losses = []
-    progress = progress(dataloader, desc=desc, unit="batch", leave=False)
-    for batch in progress:
+    pbar = progress(dataloader, desc=desc, unit="batch", leave=False)
+    for batch in pbar:
         batch_data, mask_data, batch_activate_site = padding_ver1(
             batch.node_feat, batch.batch, batch.node_feat.shape[1], batch.activate_site
         )
@@ -183,7 +183,7 @@ def run_epoch(
                 loss.backward()
                 optimizer.step()
         losses.append(float(loss.detach().cpu()))
-        progress.set_postfix(loss=f"{losses[-1]:.4f}")
+        pbar.set_postfix(loss=f"{losses[-1]:.4f}")
     return float(sum(losses) / max(1, len(losses)))
 
 
