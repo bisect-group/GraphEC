@@ -1,0 +1,26 @@
+# Run from the submodule root: baselines/GraphEC
+PY=/home/adhil/.conda/envs/mldb/bin/python
+
+# All split folders, 3 seeds, test and val evaluation; --gpus lists the GPU ids to use
+$PY -m emulator_bench.queue_pipeline --gpus 0 1 2 3 --runs-per-gpu 1 --eval-split both
+
+# One split group, one seed, bf16, custom residue budget
+$PY -m emulator_bench.queue_pipeline --gpus 0 --split-group random_splits_grouped_sequence \
+  --seed 666 --amp --max-residues 5000
+
+# Mean and std over seeds
+$PY -m emulator_bench.aggregate_results
+
+# Tests
+$PY -m pytest tests -q
+
+# Feature cache only, sharded over 4 GPUs (the first 4 visible GPUs), DSSP on 16 CPU threads
+CUDA_VISIBLE_DEVICES=0,1,2,3 $PY -m emulator_bench.cache_features --num-gpus 4 --dssp-workers 16
+
+# Opt-in speed-ups: torch.compile in train, more active-site shards per GPU
+$PY -m emulator_bench.queue_pipeline --gpus 0 1 2 3 --compile --active-site-procs-per-gpu 2
+
+# GPU probes (one GPU each; see README.md, Probes)
+CUDA_VISIBLE_DEVICES=1 $PY -m emulator_bench.probes.exactness_probe --out /tmp/exactness.json --work-dir /tmp/probe_data
+CUDA_VISIBLE_DEVICES=1 $PY -m emulator_bench.probes.precision_probe --out /tmp/precision.json --work-dir /tmp/probe_data --train-fraction 0.1 --epochs 2
+CUDA_VISIBLE_DEVICES=1 $PY -m emulator_bench.probes.compile_probe --out /tmp/compile.json --work-dir /tmp/probe_data
