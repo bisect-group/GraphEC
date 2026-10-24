@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import queue
 import subprocess
-from pathlib import Path
+from concurrent.futures import Future, ThreadPoolExecutor
 
+from .dataset_adapter import select_split_groups
+from .train import DEFAULT_MAX_RESIDUES
 from .utils import (
     BASELINE_ROOT,
-    DEFAULT_CACHE_ROOT,
     DEFAULT_DATASET_ROOT,
-    DEFAULT_RUNS_ROOT,
+    DEFAULT_OUT_ROOT,
+    DEFAULT_SEEDS,
     conda_python,
     find_spooler,
-    seed_results_root_for_split,
+    runs_root,
     seed_run_root_for_split,
-    seed_train_metadata_path_for_split,
     shell_join,
     split_group_slug,
     submit_ts_job,
@@ -21,189 +23,200 @@ from .utils import (
     write_json,
 )
 
+MAX_BACKGROUND_EVALS = 2
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Queue GraphEC EMULaToR cache/train with ts and optionally run eval directly"
+        description="Cache features, then train and evaluate GraphEC for every split and seed"
     )
     parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT))
-    parser.add_argument("--split-group", action="append", required=True)
-    parser.add_argument("--runs-root", default=str(DEFAULT_RUNS_ROOT))
-    parser.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT))
-    parser.add_argument("--env-name", default="graphec")
+    parser.add_argument("--split-group", action="append", help="default: every split folder")
+    parser.add_argument("--out-root", default=str(DEFAULT_OUT_ROOT))
+    parser.add_argument("--env-name", default="mldb")
+    parser.add_argument("--execution-mode", choices=["direct", "ts"], default="direct")
     parser.add_argument("--spooler-bin", default=None)
-    parser.add_argument("--execution-mode", choices=["ts", "direct"], default="ts")
     parser.add_argument("--epochs", type=int, default=35)
-    parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--precision", choices=["auto", "fp32", "bf16", "fp16"], default="auto")
-    parser.add_argument("--max-seq-length", type=int, default=1022)
     parser.add_argument("--limit-per-split", type=int, default=None)
     parser.add_argument("--prottrans-model-path", default=None)
     parser.add_argument("--eval-split", choices=["val", "test", "both"], default="test")
-    parser.add_argument("--eval-mode", choices=["direct", "ts"], default="direct")
-    parser.add_argument("--eval-cuda-device", default="0")
-    parser.add_argument("--cuda-visible-devices", default=None)
-    parser.add_argument("--cache-gpus", type=int, default=1)
-    parser.add_argument("--train-gpus", type=int, default=1)
-    parser.add_argument("--eval-gpus", type=int, default=1)
+    parser.add_argument(
+        "--gpus",
+        nargs="+",
+        default=["0"],
+        help="each run gets one of these GPUs through CUDA_VISIBLE_DEVICES",
+    )
+    parser.add_argument("--runs-per-gpu", "--runs_per_gpu", type=int, default=1)
+    parser.add_argument("--amp", action="store_true", help="bf16 autocast in train and evaluate")
+    parser.add_argument("--no-tf32", action="store_true", help="fp32 matmuls without TF32")
+    parser.add_argument("--compile", action="store_true", help="torch.compile in train only")
+    parser.add_argument("--active-site-procs-per-gpu", type=int, default=1)
+    parser.add_argument("--max-residues", type=int, default=DEFAULT_MAX_RESIDUES)
     parser.add_argument("--seed", type=int, action="append")
-    parser.add_argument("--wait", action="store_true")
     parser.add_argument("--skip-feature-generation", action="store_true")
     return parser.parse_args()
 
 
-def with_repo_prefix(command: list[str], cuda_visible_devices: str | None) -> str:
-    cmd = shell_join(command)
-    if cuda_visible_devices is not None:
-        cmd = f"env CUDA_VISIBLE_DEVICES={shell_join([cuda_visible_devices])} {cmd}"
-    return f"cd {shell_join([BASELINE_ROOT])} && {cmd}"
+def with_repo_prefix(command: list[str], gpu: str) -> str:
+    return (
+        f"cd {shell_join([BASELINE_ROOT])} && env CUDA_VISIBLE_DEVICES={gpu} {shell_join(command)}"
+    )
+
+
+def build_commands(args: argparse.Namespace, split_group: str, seed: int) -> dict[str, list[str]]:
+    python = conda_python(args.env_name)
+    flags = ["--amp"] if args.amp else []
+    flags += ["--no-tf32"] if args.no_tf32 else []
+    flags += ["--max-residues", str(args.max_residues)]
+    common = ["--split-group", split_group, "--out-root", args.out_root, "--seed", str(seed)]
+    return {
+        "train": [
+            *python,
+            "-m",
+            "emulator_bench.train",
+            *common,
+            "--epochs",
+            str(args.epochs),
+            "--batch-size",
+            str(args.batch_size),
+            *flags,
+            *(["--compile"] if args.compile else []),
+        ],
+        "eval": [
+            *python,
+            "-m",
+            "emulator_bench.evaluate",
+            *common,
+            "--eval-split",
+            args.eval_split,
+            "--batch-size",
+            str(args.batch_size),
+            *flags,
+        ],
+    }
+
+
+def cache_command(args: argparse.Namespace, split_group: str) -> list[str]:
+    command = [
+        *conda_python(args.env_name),
+        "-m",
+        "emulator_bench.cache_features",
+        "--dataset-root",
+        args.dataset_root,
+        "--split-group",
+        split_group,
+        "--out-root",
+        args.out_root,
+    ]
+    if args.execution_mode == "direct":
+        command += ["--num-gpus", str(len(args.gpus))]
+    command += ["--active-site-procs-per-gpu", str(args.active_site_procs_per_gpu)]
+    if args.limit_per_split is not None:
+        command += ["--limit-per-split", str(args.limit_per_split)]
+    if args.prottrans_model_path:
+        command += ["--prottrans-model-path", args.prottrans_model_path]
+    if args.skip_feature_generation:
+        command.append("--skip-feature-generation")
+    return command
+
+
+def run_direct(
+    jobs: list[dict], gpus: list[str], runs_per_gpu: int, max_evals: int = MAX_BACKGROUND_EVALS
+) -> None:
+    """Train each job on a GPU slot. A finished training frees its slot at once; its evaluation
+    runs in the background on the same GPU, at most `max_evals` at a time. Raises after all runs
+    end if any training or evaluation failed."""
+    slots: queue.Queue[str] = queue.Queue()
+    for _ in range(runs_per_gpu):
+        for gpu in gpus:
+            slots.put(gpu)
+
+    def run_command(argv: list[str], gpu: str) -> None:
+        subprocess.run(["bash", "-lc", with_repo_prefix(argv, gpu)], check=True)
+
+    def train(job: dict, evaluations: ThreadPoolExecutor) -> Future:
+        gpu = slots.get()
+        try:
+            run_command(job["train_argv"], gpu)
+        finally:
+            slots.put(gpu)
+        return evaluations.submit(run_command, job["eval_argv"], gpu)
+
+    with ThreadPoolExecutor(max_workers=max_evals) as evaluations:
+        with ThreadPoolExecutor(max_workers=len(gpus) * runs_per_gpu) as trainings:
+            training_futures = [trainings.submit(train, job, evaluations) for job in jobs]
+    evaluation_futures = [f.result() for f in training_futures if f.exception() is None]
+    failures = [
+        future.exception()
+        for future in training_futures + evaluation_futures
+        if future.exception() is not None
+    ]
+    if failures:
+        raise RuntimeError(f"{len(failures)} training or evaluation runs failed: {failures}")
 
 
 def main() -> None:
     args = parse_args()
-    seeds = args.seed if args.seed else [0]
+    seeds = args.seed or list(DEFAULT_SEEDS)
+    runs = runs_root(args.out_root)
+    split_groups = [g.name for g in select_split_groups(args.dataset_root, args.split_group)]
     if args.execution_mode == "ts":
         find_spooler(args.spooler_bin)
     jobs = []
-    for split_group in args.split_group:
-        cache_command = [
-            *conda_python(args.env_name),
-            "-m",
-            "emulator_bench.cache_features",
-            "--dataset-root",
-            args.dataset_root,
-            "--split-group",
-            split_group,
-            "--runs-root",
-            args.runs_root,
-            "--cache-root",
-            args.cache_root,
-            "--max-seq-length",
-            str(args.max_seq_length),
-        ]
-        if args.limit_per_split is not None:
-            cache_command.extend(["--limit-per-split", str(args.limit_per_split)])
-        if args.prottrans_model_path:
-            cache_command.extend(["--prottrans-model-path", args.prottrans_model_path])
-        if args.skip_feature_generation:
-            cache_command.append("--skip-feature-generation")
-        split_slug = split_group_slug(split_group)
-        cache_invocation = with_repo_prefix(cache_command, args.cuda_visible_devices)
-        cache_job = None
-        if args.execution_mode == "ts":
-            cache_job = submit_ts_job(
-                cache_invocation,
-                label=f"graphec-cache-{split_slug}",
-                log_name=f"graphec-cache-{split_slug}.log",
-                gpus=args.cache_gpus,
+    cache_jobs = {}
+    for split_group in split_groups:
+        cache_argv = cache_command(args, split_group)
+        if args.execution_mode == "direct":
+            all_gpus = ",".join(args.gpus)
+            subprocess.run(["bash", "-lc", with_repo_prefix(cache_argv, all_gpus)], check=True)
+        else:
+            cache_jobs[split_group] = submit_ts_job(
+                with_repo_prefix(cache_argv, args.gpus[0]),
+                label=f"graphec-cache-{split_group_slug(split_group)}",
+                log_name=f"graphec-cache-{split_group_slug(split_group)}.log",
+                gpus=1,
                 spooler_bin=args.spooler_bin,
             )
         for seed in seeds:
-            train_command = [
-                *conda_python(args.env_name),
-                "-m",
-                "emulator_bench.train",
-                "--split-group",
-                split_group,
-                "--runs-root",
-                args.runs_root,
-                "--cache-root",
-                args.cache_root,
-                "--env-name",
-                args.env_name,
-                "--seed",
-                str(seed),
-                "--epochs",
-                str(args.epochs),
-                "--folds",
-                str(args.folds),
-                "--batch-size",
-                str(args.batch_size),
-                "--precision",
-                args.precision,
-            ]
-            eval_command = [
-                *conda_python(args.env_name),
-                "-m",
-                "emulator_bench.evaluate",
-                "--split-group",
-                split_group,
-                "--runs-root",
-                args.runs_root,
-                "--cache-root",
-                args.cache_root,
-                "--seed",
-                str(seed),
-                "--eval-split",
-                args.eval_split,
-                "--batch-size",
-                str(args.batch_size),
-                "--precision",
-                args.precision,
-            ]
-            slug = f"{split_slug}_seed{seed}"
-            train_invocation = with_repo_prefix(train_command, args.cuda_visible_devices)
-            train_job = None
-            if args.execution_mode == "ts":
-                train_job = submit_ts_job(
-                    train_invocation,
-                    label=f"graphec-train-{slug}",
-                    log_name=f"graphec-train-{slug}.log",
-                    depends_on=[cache_job],
-                    gpus=args.train_gpus,
-                    spooler_bin=args.spooler_bin,
-                )
-            direct_eval_command = with_repo_prefix(eval_command, args.eval_cuda_device)
-            eval_job = None
-            if args.execution_mode == "ts" and args.eval_mode == "ts":
-                eval_job = submit_ts_job(
-                    with_repo_prefix(eval_command, args.cuda_visible_devices),
-                    label=f"graphec-eval-{slug}",
-                    log_name=f"graphec-eval-{slug}.log",
-                    depends_on=[train_job],
-                    gpus=args.eval_gpus,
-                    spooler_bin=args.spooler_bin,
-                )
-            elif args.execution_mode == "ts":
-                print(
-                    f"[emulator_bench] direct eval after train job {train_job}: {direct_eval_command}",
-                    flush=True,
-                )
+            commands = build_commands(args, split_group, seed)
             jobs.append(
                 {
                     "split_group": split_group,
                     "seed": seed,
-                    "execution_mode": args.execution_mode,
-                    "cache_job": cache_job,
-                    "train_job": train_job,
-                    "eval_job": eval_job,
-                    "cache_command": cache_invocation,
-                    "train_command": train_invocation,
-                    "eval_mode": args.eval_mode,
-                    "direct_eval_command": direct_eval_command,
-                    "expected_outputs": {
-                        "seed_run_root": str(seed_run_root_for_split(split_group, seed, args.runs_root)),
-                        "train_metadata": str(
-                            seed_train_metadata_path_for_split(split_group, seed, args.runs_root)
-                        ),
-                        "results_root": str(seed_results_root_for_split(split_group, seed, args.runs_root)),
-                    },
+                    "train_argv": commands["train"],
+                    "eval_argv": commands["eval"],
+                    "seed_run_root": str(seed_run_root_for_split(split_group, seed, runs)),
                 }
             )
-    write_json(Path(args.runs_root) / "queued_jobs.json", jobs)
-    if args.wait:
-        if args.execution_mode == "ts" and args.eval_mode == "ts":
-            wait_for_ts_jobs([job["eval_job"] for job in jobs], spooler_bin=args.spooler_bin)
-        elif args.execution_mode == "ts":
-            wait_for_ts_jobs([job["train_job"] for job in jobs], spooler_bin=args.spooler_bin)
-            for job in jobs:
-                subprocess.run(["bash", "-lc", job["direct_eval_command"]], check=True)
-        else:
-            for job in jobs:
-                subprocess.run(["bash", "-lc", job["cache_command"]], check=True)
-                subprocess.run(["bash", "-lc", job["train_command"]], check=True)
-                subprocess.run(["bash", "-lc", job["direct_eval_command"]], check=True)
+    write_json(runs / "queued_jobs.json", jobs)
+    if args.execution_mode == "direct":
+        run_direct(jobs, args.gpus, args.runs_per_gpu)
+        return
+    # ts assigns GPUs round-robin; set `ts -S` to len(gpus) * runs_per_gpu.
+    ts_ids = []
+    for index, job in enumerate(jobs):
+        gpu = args.gpus[index % len(args.gpus)]
+        slug = f"{split_group_slug(job['split_group'])}_seed{job['seed']}"
+        train_id = submit_ts_job(
+            with_repo_prefix(job["train_argv"], gpu),
+            label=f"graphec-train-{slug}",
+            log_name=f"graphec-train-{slug}.log",
+            depends_on=[cache_jobs[job["split_group"]]],
+            gpus=1,
+            spooler_bin=args.spooler_bin,
+        )
+        ts_ids.append(
+            submit_ts_job(
+                with_repo_prefix(job["eval_argv"], gpu),
+                label=f"graphec-eval-{slug}",
+                log_name=f"graphec-eval-{slug}.log",
+                depends_on=[train_id],
+                gpus=1,
+                spooler_bin=args.spooler_bin,
+            )
+        )
+    wait_for_ts_jobs(ts_ids, spooler_bin=args.spooler_bin)
 
 
 if __name__ == "__main__":

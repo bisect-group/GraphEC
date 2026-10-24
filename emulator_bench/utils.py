@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import resource
 import shutil
 import subprocess
 import sys
@@ -13,11 +15,24 @@ from typing import Iterable, Sequence
 
 
 BASELINE_ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_ROOT = BASELINE_ROOT / "emulator_bench"
-DEFAULT_DATASET_ROOT = BASELINE_ROOT.parents[1] / "data/processed/datasets/enzyme_classification_dataset"
-DEFAULT_RUNS_ROOT = PACKAGE_ROOT / "runs"
-DEFAULT_CACHE_ROOT = PACKAGE_ROOT / "cache/enzyme_classification_dataset"
+DEFAULT_DATASET_ROOT = (
+    BASELINE_ROOT.parents[1] / "data/processed/datasets/enzyme_classification_dataset"
+)
+DEFAULT_OUT_ROOT = BASELINE_ROOT.parents[1] / "outputs/baselines/GraphEC"
+TASK = "enzyme_classification"
+DEFAULT_RUNS_ROOT = DEFAULT_OUT_ROOT / TASK
+DEFAULT_CACHE_ROOT = DEFAULT_OUT_ROOT / "embeddings"
+DEFAULT_STRUCTURE_ROOT = BASELINE_ROOT.parents[1] / "data/intermediate"
+DEFAULT_SEEDS = (666, 777, 888)
 SPLIT_NAMES = ("train", "val", "test")
+
+
+def runs_root(out_root: str | Path) -> Path:
+    return Path(out_root) / TASK
+
+
+def cache_root(out_root: str | Path) -> Path:
+    return Path(out_root) / "embeddings"
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -39,12 +54,24 @@ def read_json(path: str | Path) -> dict:
 
 
 def write_json(path: str | Path, data: object) -> Path:
+    """Write through a temporary file and an atomic rename, so readers never see half a file."""
     path = Path(path)
     ensure_dir(path.parent)
-    with path.open("w") as handle:
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    os.replace(temporary, path)
     return path
+
+
+def merge_json(path: str | Path, new: dict) -> None:
+    """Merge `new` into the JSON object at `path` under a file lock, so parallel jobs add up."""
+    path = Path(path)
+    ensure_dir(path.parent)
+    with path.with_name(f"{path.name}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        write_json(path, {**(read_json(path) if path.exists() else {}), **new})
 
 
 def split_group_slug(split_group: str) -> str:
@@ -54,12 +81,18 @@ def split_group_slug(split_group: str) -> str:
 def safe_id(value: object) -> str:
     text = str(value).strip()
     text = re.sub(r"\s+", "_", text)
-    text = re.sub(r"[^A-Za-z0-9_.|:-]+", "_", text)
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "_", text)
     return text[:180] or "missing_id"
 
 
+def split_run_root(split_group: str, runs_root: str | Path = DEFAULT_RUNS_ROOT) -> Path:
+    """`<group>/<threshold_*>` for threshold folders, `<group>/all` for flat split folders."""
+    group = split_group.strip("/")
+    return Path(runs_root) / (group if "/" in group else f"{group}/all")
+
+
 def metadata_path_for_split(split_group: str, runs_root: str | Path = DEFAULT_RUNS_ROOT) -> Path:
-    return Path(runs_root) / split_group_slug(split_group) / "metadata.json"
+    return split_run_root(split_group, runs_root) / "metadata.json"
 
 
 def load_run_metadata(split_group: str, runs_root: str | Path = DEFAULT_RUNS_ROOT) -> dict:
@@ -72,7 +105,7 @@ def load_run_metadata(split_group: str, runs_root: str | Path = DEFAULT_RUNS_ROO
 def seed_run_root_for_split(
     split_group: str, seed: int, runs_root: str | Path = DEFAULT_RUNS_ROOT
 ) -> Path:
-    return Path(runs_root) / split_group_slug(split_group) / "seeds" / str(seed)
+    return split_run_root(split_group, runs_root) / f"seed_{seed}"
 
 
 def seed_train_metadata_path_for_split(
@@ -84,7 +117,7 @@ def seed_train_metadata_path_for_split(
 def seed_results_root_for_split(
     split_group: str, seed: int, runs_root: str | Path = DEFAULT_RUNS_ROOT
 ) -> Path:
-    return seed_run_root_for_split(split_group, seed, runs_root) / "results"
+    return seed_run_root_for_split(split_group, seed, runs_root)
 
 
 def conda_python(env_name: str) -> list[str]:
@@ -151,6 +184,7 @@ def wait_for_ts_jobs(
     except ModuleNotFoundError:
         import sys
         from pathlib import Path
+
         sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
         from src.utils.rich_progress import progress
 
@@ -174,13 +208,20 @@ def wait_for_ts_jobs(
 
 
 @contextmanager
-def baseline_cwd():
+def baseline_cwd(data_root: str | Path | None = None):
+    """Work from `data_root` (see `run_data_root`) or the baseline root, with the baseline root on
+    `sys.path` so its packages import from either."""
     old_cwd = Path.cwd()
-    os.chdir(BASELINE_ROOT)
+    added = str(BASELINE_ROOT) not in sys.path
+    if added:
+        sys.path.insert(0, str(BASELINE_ROOT))
+    os.chdir(data_root or BASELINE_ROOT)
     try:
         yield
     finally:
         os.chdir(old_cwd)
+        if added and str(BASELINE_ROOT) in sys.path:
+            sys.path.remove(str(BASELINE_ROOT))
 
 
 def import_task_module(task_dir: str, module_name: str):
@@ -201,74 +242,100 @@ def import_task_module(task_dir: str, module_name: str):
             pass
 
 
-def choose_precision(requested: str) -> str:
-    if requested != "auto":
-        return requested
-    import torch
-
-    if torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)():
-        return "bf16"
-    if torch.cuda.is_available():
-        return "fp16"
-    return "fp32"
-
-
-def autocast_kwargs(precision: str) -> dict:
-    import torch
-
-    if precision == "bf16":
-        return {"enabled": True, "dtype": torch.bfloat16}
-    if precision == "fp16":
-        return {"enabled": True, "dtype": torch.float16}
-    return {"enabled": False}
-
-
 def link_or_copy(source: Path, target: Path) -> None:
     if not source.exists():
         raise FileNotFoundError(source)
     ensure_dir(target.parent)
+    if target.is_symlink() and target.resolve() != source.resolve():
+        target.unlink()
     if target.exists() or target.is_symlink():
         return
     try:
         target.symlink_to(source.resolve())
+    except FileExistsError:
+        pass
     except OSError:
         shutil.copy2(source, target)
 
 
-def graph_data_dirs() -> dict[str, Path]:
-    return {
-        "structures": BASELINE_ROOT / "Data/Structures",
-        "prottrans": BASELINE_ROOT / "Data/ProtTrans",
-        "dssp": BASELINE_ROOT / "Data/DSSP",
-    }
+def run_data_root(base: str | Path) -> Path:
+    """Working directory of one run. The original dataset code reads `./Data/...`, so each run
+    gets its own `Data` folder under `base` and never shares links with another run."""
+    base = ensure_dir(base)
+    for name in ("Structures", "ProtTrans", "DSSP"):
+        ensure_dir(base / "Data" / name)
+    for name in ("Max_ProtTrans.npy", "Min_ProtTrans.npy"):
+        link_or_copy(BASELINE_ROOT / "Data/ProtTrans" / name, base / "Data/ProtTrans" / name)
+    return base
+
+
+FEATURE_CACHE_VERSION = 1
 
 
 def cache_dirs(cache_root: str | Path) -> dict[str, Path]:
+    """Feature folders. The version is in the name, so a bump forces a rebuild."""
     root = Path(cache_root)
+    v = FEATURE_CACHE_VERSION
     return {
-        "structures": ensure_dir(root / "Structures"),
-        "prottrans": ensure_dir(root / "ProtTrans"),
-        "dssp": ensure_dir(root / "DSSP"),
-        "active_sites": ensure_dir(root / "ActiveSites"),
+        "structures": ensure_dir(root / f"structures_v{v}"),
+        "prottrans": ensure_dir(root / f"prottrans_v{v}"),
+        "dssp": ensure_dir(root / f"dssp_v{v}"),
+        "active_sites": ensure_dir(root / f"active_sites_v{v}"),
         "fastas": ensure_dir(root / "fastas"),
         "tmp": ensure_dir(root / "tmp"),
     }
 
 
-def ensure_graphec_data_links(keys: Iterable[str], cache_root: str | Path) -> None:
+def ensure_graphec_data_links(
+    feature_keys: dict[str, str], cache_root: str | Path, data_root: str | Path
+) -> None:
+    """Link cached features under the sample names the original data loader reads, inside the
+    `Data` folder of `data_root` (see `run_data_root`).
+
+    `feature_keys` maps a sample name to the sequence hash that names its cache files.
+    """
     dirs = cache_dirs(cache_root)
-    graph_dirs = graph_data_dirs()
-    for directory in graph_dirs.values():
-        ensure_dir(directory)
-    for key in keys:
-        for suffix in (".tensor", ".pdb"):
-            source = dirs["structures"] / f"{key}{suffix}"
-            if source.exists():
-                link_or_copy(source, graph_dirs["structures"] / f"{key}{suffix}")
-        for name in ("prottrans", "dssp"):
-            source = dirs[name] / f"{key}.tensor"
-            if source.exists():
-                link_or_copy(source, graph_dirs[name] / f"{key}.tensor")
+    data = run_data_root(data_root) / "Data"
+    for kind, folder in (
+        ("structures", "Structures"),
+        ("prottrans", "ProtTrans"),
+        ("dssp", "DSSP"),
+    ):
+        source_dir = dirs[kind].resolve()
+        target_dir = ensure_dir(data / folder)
+        available = set(os.listdir(source_dir))
+        for name, key in feature_keys.items():
+            if f"{key}.tensor" not in available:
+                continue
+            source, target = f"{source_dir}/{key}.tensor", f"{target_dir}/{name}.tensor"
+            try:
+                os.symlink(source, target)
+            except FileExistsError:
+                link_or_copy(Path(source), Path(target))
+            except OSError:
+                shutil.copy2(source, target)
+
+
+def feature_failures_path(cache_root: str | Path) -> Path:
+    return Path(cache_root) / "feature_failures.json"
+
+
+def load_feature_failures(cache_root: str | Path) -> dict[str, dict]:
+    """Sequences that could not be featurized, as {sequence hash: {"length", "reason"}}."""
+    path = feature_failures_path(cache_root)
+    return read_json(path) if path.exists() else {}
+
+
+def record_feature_failures(cache_root: str | Path, failures: dict[str, dict]) -> None:
+    if failures:
+        merge_json(feature_failures_path(cache_root), failures)
+
+
+def feature_keys_from_manifest(path: str | Path) -> dict[str, str]:
+    import pandas as pd
+
+    manifest = pd.read_csv(path, dtype=str, usecols=["cache_key", "sequence_sha256"])
+    return dict(zip(manifest["cache_key"], manifest["sequence_sha256"]))
 
 
 def set_seed(seed: int) -> None:
@@ -285,3 +352,17 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+
+
+def raise_open_file_limit() -> None:
+    """Raise the soft open-file limit to the hard limit; data loader workers pass tensors through
+    file descriptors."""
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+
+
+def set_tf32(enabled: bool) -> None:
+    import torch
+
+    torch.backends.cuda.matmul.allow_tf32 = enabled
+    torch.backends.cudnn.allow_tf32 = enabled

@@ -105,10 +105,7 @@ def compute_care_metrics(care_df: pd.DataFrame, k_values: tuple[int, ...] = (1, 
             for level in (4, 3, 2, 1)
         }
         metrics[f"k={k}"].update(
-            {
-                f"level_{level}_support": int(len(rows))
-                for level in (4, 3, 2, 1)
-            }
+            {f"level_{level}_support": int(len(rows)) for level in (4, 3, 2, 1)}
         )
     return metrics
 
@@ -156,9 +153,7 @@ def compute_supplemental_ranking_metrics(
         },
     }
     label_metrics = {
-        "mrr": round(float(np.mean(label_reciprocal_ranks)), 6)
-        if label_reciprocal_ranks
-        else 0.0,
+        "mrr": round(float(np.mean(label_reciprocal_ranks)), 6) if label_reciprocal_ranks else 0.0,
         **{
             f"hit@{k}": round(float(np.mean(values)) * 100.0, 4) if values else 0.0
             for k, values in label_hits.items()
@@ -173,7 +168,9 @@ def compute_supplemental_ranking_metrics(
     }
 
 
-def compute_supplemental_classification_metrics(y_true: np.ndarray, predictions: np.ndarray) -> dict:
+def compute_supplemental_classification_metrics(
+    y_true: np.ndarray, predictions: np.ndarray
+) -> dict:
     if y_true.size == 0:
         return {
             average: {"precision": 0.0, "recall": 0.0, "f1": 0.0}
@@ -205,7 +202,9 @@ def multilabel_targets(labels: list[str], label_to_idx: dict[str, int]) -> np.nd
     return target
 
 
-def compute_graphec_metrics(y_true: np.ndarray, scores: np.ndarray, threshold: float = 0.5) -> dict:
+def compute_graphec_metrics(
+    y_true: np.ndarray, scores: np.ndarray, threshold: float = 0.5
+) -> dict:
     if y_true.size == 0:
         return {}
     pred = (scores >= threshold).astype(int)
@@ -216,7 +215,9 @@ def compute_graphec_metrics(y_true: np.ndarray, scores: np.ndarray, threshold: f
         "micro_precision": float(precision_score(flat_true, flat_pred, zero_division=0)),
         "micro_recall": float(recall_score(flat_true, flat_pred, zero_division=0)),
         "micro_f1": float(f1_score(flat_true, flat_pred, zero_division=0)),
-        "mcc": float(matthews_corrcoef(flat_true, flat_pred)) if len(np.unique(flat_true)) > 1 else 0.0,
+        "mcc": float(matthews_corrcoef(flat_true, flat_pred))
+        if len(np.unique(flat_true)) > 1
+        else 0.0,
         "exact_match_accuracy": float(np.mean(np.all(pred == y_true, axis=1))),
     }
     if len(np.unique(flat_true)) > 1:
@@ -243,11 +244,16 @@ def write_ranked_outputs(
     output_csv: str | Path,
     *,
     top_k: int = 50,
+    missing: np.ndarray | None = None,
 ) -> pd.DataFrame:
+    """Write the ranked ECs per row. Rows flagged in `missing` get empty ranks."""
     manifest = pd.read_csv(manifest_csv)
     rank_rows = []
     max_k = min(top_k, len(labels))
-    for row_scores in scores:
+    for index, row_scores in enumerate(scores):
+        if missing is not None and missing[index]:
+            rank_rows.append([np.nan] * max_k)
+            continue
         ranked_indices = np.argsort(row_scores)[::-1][:max_k]
         rank_rows.append([labels[index] for index in ranked_indices])
     rank_df = pd.DataFrame(rank_rows, columns=[str(index) for index in range(max_k)])
@@ -264,11 +270,10 @@ def write_ranked_outputs(
 def compact_evaluation_summary(all_metrics, *, train_metadata=None) -> dict:
     metrics_list = list(all_metrics)
     first = metrics_list[0] if metrics_list else {}
-    fold_results = (train_metadata or {}).get("fold_results", [])
     summary = {
         "split_group": first.get("split_group"),
         "seed": first.get("seed"),
-        "fold_checkpoints": [fold.get("checkpoint") for fold in fold_results],
+        "checkpoint": (train_metadata or {}).get("checkpoint"),
         "eval_splits": [metrics.get("eval_split") for metrics in metrics_list],
         "metrics_files": {},
         "care_ranked_csvs": {},

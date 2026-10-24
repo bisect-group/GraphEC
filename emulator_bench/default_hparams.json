@@ -1,0 +1,22 @@
+{
+  "epochs": 35,
+  "model": "single model, early stopping on the benchmark val split",
+  "batch_size": 32,
+  "max_residues": 5000,
+  "lr": 1e-4,
+  "lr_published": false,
+  "optimizer": "Adam",
+  "loss": "BCE",
+  "patience": 4,
+  "dropout": 0.1,
+  "gnn_layers": 3,
+  "hidden_dim": 256,
+  "edge_dim": 450,
+  "label_diffusion": {"lambda": 0.1, "identity_cutoff": 0.1, "diamond": "--very-sensitive"},
+  "seeds": [666, 777, 888],
+  "structure_sources": ["experimental_mmcif_chain", "esmfold2_pdb", "esm", "alphafold", "esmfold_v1_hf"],
+  "max_sequence_length": null,
+  "amp": false,
+  "tf32": true,
+  "compile": false
+}

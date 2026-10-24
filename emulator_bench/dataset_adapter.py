@@ -5,13 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
+
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
+
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 from .utils import (
     DEFAULT_DATASET_ROOT,
@@ -21,6 +23,7 @@ from .utils import (
     resolve_path,
     safe_id,
     split_group_slug,
+    split_run_root,
     write_json,
 )
 
@@ -36,17 +39,32 @@ class SplitGroup:
     path: Path
 
 
+DEFAULT_SPLIT_GROUPS = (
+    "random_splits_grouped_sequence",
+    "uniprot_time_splits",
+    "enzyme_sequence_splits",
+    "enzyme_structure_splits",
+)
+
+
 def discover_split_groups(dataset_root: str | Path = DEFAULT_DATASET_ROOT) -> list[SplitGroup]:
+    """Default split folders on disk. Threshold folders are read from disk, never hardcoded."""
     root = resolve_path(dataset_root)
     if not root.exists():
         raise FileNotFoundError(f"Dataset root does not exist: {root}")
-    groups = []
-    for train_file in sorted(root.rglob("train.parquet")):
-        parent = train_file.parent
-        if all((parent / f"{split}.parquet").exists() for split in SPLIT_NAMES):
-            groups.append(SplitGroup(parent.relative_to(root).as_posix(), parent))
+    candidates = []
+    for name in DEFAULT_SPLIT_GROUPS:
+        folder = root / name
+        candidates.extend(
+            sorted(folder.glob("threshold_*")) if name.startswith("enzyme_") else [folder]
+        )
+    groups = [
+        SplitGroup(folder.relative_to(root).as_posix(), folder)
+        for folder in candidates
+        if all((folder / f"{split}.parquet").exists() for split in SPLIT_NAMES)
+    ]
     if not groups:
-        raise FileNotFoundError(f"No train/val/test split groups found under {root}")
+        raise FileNotFoundError(f"No train/val/test split folders found under {root}")
     return groups
 
 
@@ -85,13 +103,17 @@ def full_ec_labels(value: object) -> list[str]:
     return sorted({label for label in split_labels(value) if is_full_ec(label)})
 
 
-def normalize_sequence(value: object, max_sequence_length: int) -> tuple[str, int]:
-    sequence = "".join(str(value).split()).upper()
-    return sequence[:max_sequence_length], len(sequence)
+def normalize_sequence(value: object) -> str:
+    return "".join(str(value).split()).upper()
 
 
 def _aggregate_text(values: pd.Series) -> str:
-    cleaned = sorted({str(value) for value in values.dropna() if str(value)})
+    items = (
+        item
+        for value in values
+        for item in (value if pd.api.types.is_list_like(value) else [value])
+    )
+    cleaned = sorted({str(item) for item in items if pd.notna(item) and str(item)})
     return ";".join(cleaned)
 
 
@@ -99,7 +121,6 @@ def load_split_records(
     parquet_path: str | Path,
     *,
     split_name: str,
-    max_sequence_length: int,
     limit: int | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     parquet_path = Path(parquet_path)
@@ -118,9 +139,7 @@ def load_split_records(
     df = df.dropna(subset=["uniprot_id", "sequence", "ec_number"])
     missing_required_rows = raw_rows - len(df)
 
-    normalized = df["sequence"].map(lambda value: normalize_sequence(value, max_sequence_length))
-    df["Sequence"] = normalized.map(lambda item: item[0])
-    df["Original Sequence Length"] = normalized.map(lambda item: item[1])
+    df["Sequence"] = df["sequence"].map(normalize_sequence)
     df["Sequence Length"] = df["Sequence"].str.len()
     invalid_residue_rows = int(
         df["Sequence"].map(lambda sequence: not set(sequence).issubset(CANONICAL_AA)).sum()
@@ -144,7 +163,6 @@ def load_split_records(
                 "Original Entry": row["Original Entry"],
                 "EC number": label,
                 "Sequence": row["Sequence"],
-                "Original Sequence Length": row["Original Sequence Length"],
                 "Sequence Length": row["Sequence Length"],
             }
             for column in OPTIONAL_COLUMNS:
@@ -160,7 +178,6 @@ def load_split_records(
                 "Original Entry",
                 "EC number",
                 "Sequence",
-                "Original Sequence Length",
                 "Sequence Length",
             ]
         )
@@ -171,7 +188,6 @@ def load_split_records(
     else:
         agg = {
             "EC number": lambda labels: ";".join(sorted(set(map(str, labels)))),
-            "Original Sequence Length": "max",
             "Sequence Length": "max",
         }
         for column in OPTIONAL_COLUMNS:
@@ -202,12 +218,6 @@ def load_split_records(
         "unique_full_ec_labels": int(records["EC number"].str.split(";").explode().nunique())
         if not records.empty
         else 0,
-        "truncated_sequences": int(
-            (records["Original Sequence Length"] > records["Sequence Length"]).sum()
-        )
-        if not records.empty
-        else 0,
-        "max_sequence_length": max_sequence_length,
         "limit": limit,
     }
     return records, stats
@@ -270,12 +280,11 @@ def prepare_split_group(
     *,
     dataset_root: str | Path,
     runs_root: str | Path = DEFAULT_RUNS_ROOT,
-    max_sequence_length: int = 1022,
     limit_per_split: int | None = None,
 ) -> dict:
     dataset_root = resolve_path(dataset_root)
     run_slug = split_group_slug(group.name)
-    run_root = Path(runs_root) / run_slug
+    run_root = split_run_root(group.name, runs_root)
     manifest_root = ensure_dir(run_root / "manifests")
     fasta_root = ensure_dir(run_root / "fastas")
     vocab_root = ensure_dir(run_root / "vocab")
@@ -286,7 +295,6 @@ def prepare_split_group(
         records, split_stats = load_split_records(
             group.path / f"{split_name}.parquet",
             split_name=f"{group.name}/{split_name}",
-            max_sequence_length=max_sequence_length,
             limit=limit_per_split,
         )
         if records.empty:
@@ -306,7 +314,6 @@ def prepare_split_group(
             "Original Entry",
             "EC number",
             "Sequence",
-            "Original Sequence Length",
             "Sequence Length",
             "cache_key",
             "sequence_sha256",
@@ -323,7 +330,6 @@ def prepare_split_group(
         "split_group": group.name,
         "run_slug": run_slug,
         "run_root": str(run_root),
-        "max_sequence_length": max_sequence_length,
         "limit_per_split": limit_per_split,
         "manifests": manifests,
         "fastas": fastas,
@@ -341,7 +347,6 @@ def prepare_dataset(
     dataset_root: str | Path = DEFAULT_DATASET_ROOT,
     split_groups: list[str] | None = None,
     runs_root: str | Path = DEFAULT_RUNS_ROOT,
-    max_sequence_length: int = 1022,
     limit_per_split: int | None = None,
 ) -> list[dict]:
     selected = select_split_groups(dataset_root, split_groups)
@@ -350,7 +355,6 @@ def prepare_dataset(
             group,
             dataset_root=dataset_root,
             runs_root=runs_root,
-            max_sequence_length=max_sequence_length,
             limit_per_split=limit_per_split,
         )
         for group in selected

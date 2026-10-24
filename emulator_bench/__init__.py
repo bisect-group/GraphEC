@@ -1,2 +1,1 @@
 """EMULaToR adapter for GraphEC."""
-
