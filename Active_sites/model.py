@@ -42,6 +42,15 @@ class GNNLayer(nn.Module):
         return h_V, h_E
 
 
+    def forward_nodes(self, h_V, edge_index, h_E, batch_id):
+        """`forward` without the edge update. For the last layer, whose h_E nothing reads."""
+        dh = self.attention(h_V, edge_index, h_E)
+        h_V = self.norm[0](h_V + self.dropout(dh))
+        dh = self.PositionWiseFeedForward(h_V)
+        h_V = self.norm[1](h_V + self.dropout(dh))
+        return self.context(h_V, batch_id)
+
+
 class EdgeMLP(nn.Module):
     """
     define MLP operation for edge updates
@@ -120,6 +129,17 @@ class Graph_encoder(nn.Module):
         
         return h_V
 
+    def forward_last_nodes_only(self, h_V, edge_index, h_E, seq, batch_id):
+        """`forward` that skips the edge update of the last layer (its h_E is not used)."""
+        if self.seq_in and seq is not None:
+            seq = self.W_s(seq)
+            h_V = torch.cat([h_V, seq], dim=-1)
+        h_V = self.W_v(self.norm_nodes(self.node_embedding(h_V)))
+        h_E = self.W_e(self.norm_edges(self.edge_embedding(h_E)))
+        for layer in self.layers[:-1]:
+            h_V, h_E = layer(h_V, edge_index, h_E, batch_id)
+        return self.layers[-1].forward_nodes(h_V, edge_index, h_E, batch_id)
+
 
 class GraphEC_AS(nn.Module): 
     """
@@ -140,14 +160,14 @@ class GraphEC_AS(nn.Module):
                 nn.init.xavier_uniform_(p)
 
 
-    def forward(self, X, h_V, edge_index, seq, batch_id):
+    def forward(self, X, h_V, edge_index, seq, batch_id, ptr=None):
         # Data augmentation
         if self.training and self.augment_eps > 0:
             X = X + self.augment_eps * torch.randn_like(X)
             h_V = h_V + self.augment_eps * torch.randn_like(h_V)
 
         # get the geometric features
-        h_V_geo, h_E = get_geo_feat(X, edge_index)
+        h_V_geo, h_E = get_geo_feat(X, edge_index, ptr)
         h_V = torch.cat([h_V, h_V_geo], dim=-1)
 
         h_V = self.Graph_encoder(h_V, edge_index, h_E, seq, batch_id) # [num_residue, hidden_dim]
@@ -159,3 +179,10 @@ class GraphEC_AS(nn.Module):
 
         output = torch.cat(output, dim=1)
         return output
+
+    def forward_geo(self, h_V, h_E, edge_index, seq, batch_id):
+        """Eval forward from precomputed geometry: `h_V` = cat(node_feat, geo node features),
+        `h_E` = geo edge features. The geometry has no parameters, so 5 fold models share it."""
+        h_V = self.Graph_encoder.forward_last_nodes_only(h_V, edge_index, h_E, seq, batch_id)
+        emb = F.elu(self._modules["FC_{}1".format(self.task)](h_V))
+        return self._modules["FC_{}2".format(self.task)](emb)

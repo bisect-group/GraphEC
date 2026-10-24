@@ -53,12 +53,12 @@ class ProteinGraphDataset(data.Dataset):
         return graph_data
 
 
-def get_geo_feat(X, edge_index):
+def get_geo_feat(X, edge_index, ptr=None):
     """
     get geometric node features and edge features
     """
     pos_embeddings = _positional_embeddings(edge_index)
-    node_angles = _get_angle(X)
+    node_angles = _get_angle(X, ptr=ptr)
     node_dist, edge_dist = _get_distance(X, edge_index)
     node_direction, edge_direction, edge_orientation = _get_direction_orientation(X, edge_index)
 
@@ -82,7 +82,15 @@ def _positional_embeddings(edge_index, num_embeddings=16):
     PE = torch.cat((torch.cos(angles), torch.sin(angles)), -1)
     return PE
 
-def _get_angle(X, eps=1e-7):
+def _zero_graph_boundaries(D, ptr):
+    """In a batch of graphs, set the angle entries that a single graph pads with zero:
+    the first entry of each graph's first residue and the last two entries of its last residue."""
+    D = D.clone()
+    D[ptr[:-1], 0] = 0
+    D[ptr[1:] - 1, 1:] = 0
+    return D
+
+def _get_angle(X, eps=1e-7, ptr=None):
     """
     get the angle features
     """
@@ -104,6 +112,8 @@ def _get_angle(X, eps=1e-7):
     D = torch.sign(torch.sum(u_2 * n_1, -1)) * torch.acos(cosD)
     D = F.pad(D, [1, 2]) # This scheme will remove phi[0], psi[-1], omega[-1]
     D = torch.reshape(D, [-1, 3])
+    if ptr is not None:
+        D = _zero_graph_boundaries(D, ptr)
     dihedral = torch.cat([torch.cos(D), torch.sin(D)], 1)
 
     # alpha, beta, gamma
@@ -112,6 +122,8 @@ def _get_angle(X, eps=1e-7):
     D = torch.acos(cosD)
     D = F.pad(D, [1, 2])
     D = torch.reshape(D, [-1, 3])
+    if ptr is not None:
+        D = _zero_graph_boundaries(D, ptr)
     bond_angles = torch.cat((torch.cos(D), torch.sin(D)), 1)
 
     node_angles = torch.cat((dihedral, bond_angles), 1)

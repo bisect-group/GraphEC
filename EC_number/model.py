@@ -58,8 +58,13 @@ class EdgeMLP(nn.Module):
         src_idx = edge_index[0]
         dst_idx = edge_index[1]
 
-        h_EV = torch.cat([h_V[src_idx], h_E, h_V[dst_idx]], dim=-1)
-        h_message = self.W12(self.act(self.W11(h_EV)))
+        # W11 on cat([h_V[src], h_E, h_V[dst]]): the two node blocks run per node, then are gathered
+        w_src, w_edge, w_dst = self.W11.weight.split(h_V.shape[1], dim=1)
+        from_src, from_dst = F.linear(h_V, w_src), F.linear(h_V, w_dst)
+        from_edge = F.linear(h_E, w_edge, self.W11.bias)
+        if torch.is_autocast_enabled():
+            from_src, from_dst, from_edge = from_src.float(), from_dst.float(), from_edge.float()
+        h_message = self.W12(self.act(from_src[src_idx] + from_edge + from_dst[dst_idx]))
         h_E = self.norm(h_E + self.dropout(h_message))
         return h_E
 
