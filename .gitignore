@@ -13,3 +13,5 @@ Data/DSSP/*
 !Data/Structures/.gitkeep
 !Data/ProtTrans/.gitkeep
 !Data/DSSP/.gitkeep
+__pycache__/
+*.pyc
