@@ -113,3 +113,25 @@ uses random proteins instead, for a dry run on the CPU.
 - `precision_probe`: fp32 seed A, bf16 seed A and fp32 seed B. It records train and val loss, val
   metrics, top-1 EC accuracy per level, and the per-layer relative error of bf16 on one batch.
 - `compile_probe`: samples per second with and without `--compile`, in fp32 and bf16.
+
+## Verify equivalence
+
+```bash
+conda activate mldb
+emulator_bench/verify_equivalence.sh        # CPU, about 30 s
+emulator_bench/verify_equivalence.sh --gpu  # also the TF32 tolerance test
+emulator_bench/verify_equivalence.sh --negative-control  # the GPU test must FAIL
+```
+
+The CPU mode compares the wrapper with the original GraphEC code in `EC_number/` on synthetic proteins.
+The synthetic ProtT5, DSSP and structure tensors stand in at the feature-cache boundary, so nothing is downloaded.
+It checks one training step (loss within 1e-6, gradients within 1e-5 of the largest gradient), the factorised edge MLP,
+batched active-site geometry, the cache keys and the label diffusion. Parameters after Adam steps are not compared,
+because Adam turns gradient noise on near-zero gradients into steps of the learning rate.
+
+Not exact: TF32 changes the arithmetic, and `--compile` is opt-in and checked only by the probes.
+ProtT5 features are computed one sequence at a time, because batching changes them beyond noise.
+The `--gpu` test trains 20 steps with TF32 (the production setting; all recorded runs used TF32 and no `--amp`) and compares with fp32 without TF32.
+The noise control is the production run with initial weights perturbed by one rounding of the production dtype (2**-11, TF32). Per step, the gap |production - fp32| must be at most 10 times the floor |perturbed production - production|. The same holds for the mean final val probability gap. Step 0 is judged like every other step: its gap must be at most 10 times its floor. Each test prints `max gap`, `max floor` and `ratio`; run with `-s` to see the line.
+`--negative-control` reruns that test with the production run's initial weights multiplied by 1.05 (`EQUIV_NEGATIVE_CONTROL=1`). It must fail, and the script exits 0 only then.
+The `--amp` bf16 option is not tested because no run uses it.
