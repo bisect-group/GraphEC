@@ -1,0 +1,9 @@
+# Run from the fork root. PY is a python with the fork's requirements (README). The paper commands; emulator_bench/run.sh runs them all.
+# Run order of run.sh: cache, train (also evaluates test and val), rescore (non-canonical test rows), aggregate. Finished runs are skipped.
+$PY -m emulator_bench.cache_features --num-gpus 3
+$PY -m emulator_bench.queue_pipeline --env-name current --gpus 0 1 2 --runs-per-gpu 1 --seed 666 --seed 777 --seed 888 --eval-split both
+$PY -m emulator_bench.rescore
+$PY -m emulator_bench.aggregate_results
+
+# Tests
+$PY -m pytest tests -q
